@@ -1,0 +1,202 @@
+// ======= Pin Definitions =======
+#define ENA 26 // PWM pin to control motor speed
+#define IN1 25 // Motor direction pin 1
+#define IN2 33 // Motor direction pin 2
+#define encoderA 12 // Encoder A (must support interrupt)
+#define encoderB 13 // Encoder B (optional if using only one edge)
+
+// === Encoder and Target ===
+volatile long encoderCount = 0;
+const float targetRPM = 150.0; // Target speed in RPM
+const float tolerance = 2.0; // RPM tolerance for stability
+
+// === PID Parameters ===
+float kp = 1.0;    // Reduced proportional gain
+float ki = 0.05;   // Reduced integral gain
+float kd = 0.1;    // Significantly reduced derivative gain
+
+// === PID Variables ===
+float previousError = 0;
+float integral = 0;
+const float maxIntegral = 50.0; // Anti-windup limit
+unsigned long lastTime = 0;
+const int maxPWM = 200; // Limiting max PWM to prevent aggressive movements
+
+// === Control Variables ===
+bool targetReached = false;
+unsigned long stabilityTimer = 0;
+const unsigned long stabilityDelay = 500; // Time motor needs to be within tolerance
+
+// === Encoder Parameters ===
+const int countsPerRevolution = 334; // Adjust based on your encoder (example value)
+const float sampleTime = 0.1; // Sample time in seconds for RPM calculation
+
+// === RPM Smoothing ===
+const int filterSize = 3; // Number of samples for moving average
+float rpmHistory[filterSize] = {0};
+int rpmIndex = 0;
+
+// === Forward declaration ===
+void IRAM_ATTR readEncoder();
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+
+  // Configure motor pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+
+  // Configure encoder pins with pull-ups
+  pinMode(encoderA, INPUT_PULLUP);
+  pinMode(encoderB, INPUT_PULLUP);
+
+  // Attach interrupt for encoder
+  attachInterrupt(digitalPinToInterrupt(encoderA), readEncoder, RISING);
+
+  // Initialize timing
+  lastTime = millis();
+
+  // Initial motor state (stopped)
+  setMotor(0);
+
+  Serial.println("Motor Velocity PID Control System");
+  Serial.println("Target speed: " + String(targetRPM) + " RPM");
+  delay(1000); // Brief pause before starting
+}
+
+// === Encoder ISR ===
+void IRAM_ATTR readEncoder() {
+  // Read B channel to determine direction
+  int b = digitalRead(encoderB);
+  encoderCount += (b == HIGH) ? 1 : -1;
+}
+
+// === Reset Encoder Count ===
+void resetEncoder() {
+  encoderCount = 0;
+  integral = 0;
+  previousError = 0;
+  Serial.println("Encoder reset to zero");
+}
+
+// === Set Motor ===
+void setMotor(int pwm) {
+  // Constrain PWM value to positive only (forward direction)
+  pwm = constrain(pwm, 0, maxPWM); // Force forward direction
+
+  if (pwm > 0) {
+    // Forward direction
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, pwm);
+  } else {
+    // Stop motor
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, 0);
+  }
+}
+
+// === Calculate RPM ===
+float calculateRPM(long currentCount, long previousCount, float dt) {
+  if (dt < 0.001) dt = 0.001; // Prevent division by zero
+  float countsPerSecond = (currentCount - previousCount) / dt;
+  float rpm = (countsPerSecond / countsPerRevolution) * 60.0;
+
+  // Apply moving average filter
+  rpmHistory[rpmIndex] = rpm;
+  rpmIndex = (rpmIndex + 1) % filterSize;
+
+  float rpmSum = 0;
+  for (int i = 0; i < filterSize; i++) {
+    rpmSum += rpmHistory[i];
+  }
+  return rpmSum / filterSize;
+}
+
+// === Main Loop with PID ===
+void loop() {
+  static long previousCount = 0;
+  static unsigned long lastSampleTime = 0;
+
+  unsigned long now = millis();
+  float dt = (now - lastSampleTime) / 1000.0;
+
+  // Update every sampleTime seconds
+  if (dt >= sampleTime) {
+    // Calculate current RPM
+    long currentCount = encoderCount;
+    float currentRPM = calculateRPM(currentCount, previousCount, dt);
+
+    // Calculate error
+    float error = targetRPM - currentRPM;
+
+    // Check if we're at target speed
+    if (abs(error) <= tolerance) {
+      if (!targetReached) {
+        stabilityTimer = millis();
+        targetReached = true;
+      }
+
+      // Ensure motor stays at speed for stabilityDelay ms
+      if (millis() - stabilityTimer >= stabilityDelay) {
+        setMotor(0);
+        Serial.println("Target speed reached and stable");
+        return;
+      }
+    } else {
+      // Reset if we drift outside tolerance
+      targetReached = false;
+    }
+
+    // PID calculations
+    // P term
+    float pTerm = kp * error;
+
+    // I term with anti-windup
+    integral += error * dt;
+    integral = constrain(integral, -maxIntegral, maxIntegral);
+    float iTerm = ki * integral;
+
+    // D term with filtering
+    float derivative = (error - previousError) / dt;
+    float dTerm = kd * derivative;
+
+    // Calculate total output and constrain it
+    float output = pTerm + iTerm + dTerm;
+    output = constrain(output, 0, maxPWM); // Constrain before applying
+
+    // Update previous values
+    previousError = error;
+    previousCount = currentCount;
+    lastSampleTime = now;
+
+    // Apply control signal
+    setMotor(output);
+
+    // Debug output
+    Serial.print(millis());
+    Serial.print(" -> RPM: ");
+    Serial.print(currentRPM);
+    Serial.print(" | Error: ");
+    Serial.print(error);
+    Serial.print(" | P: ");
+    Serial.print(pTerm);
+    Serial.print(" | I: ");
+    Serial.print(iTerm);
+    Serial.print(" | D: ");
+    Serial.print(dTerm);
+    Serial.print(" | PWM: ");
+    Serial.println(output);
+  }
+
+  // Optional: Reset encoder if user sends 'r' over serial
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'r') {
+      resetEncoder();
+    }
+  }
+}
