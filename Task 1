@@ -1,0 +1,218 @@
+#include <Arduino.h>
+#include <Wire.h>
+
+// Define I2C pins for ESP32
+#define I2C_SDA 23
+#define I2C_SCL 22
+
+// MPU6050 I2C Address
+const int MPU6050_ADDR = 0x68;
+
+// MPU6050 Register Addresses
+const int PWR_MGMT_1   = 0x6B;
+const int ACCEL_XOUT_H = 0x3B;
+const int ACCEL_YOUT_H = 0x3D;
+const int ACCEL_ZOUT_H = 0x3F;
+const int GYRO_XOUT_H  = 0x43;
+const int GYRO_YOUT_H  = 0x45;
+const int GYRO_ZOUT_H  = 0x47;
+
+// Sensor data
+int16_t rawAccX, rawAccY, rawAccZ;
+int16_t rawGyroX, rawGyroY, rawGyroZ;
+
+// Sensitivity Scale Factors
+const float ACCEL_SENSITIVITY = 16384.0; // ±2g
+const float GYRO_SENSITIVITY = 131.0;    // ±250°/s
+
+// Processed sensor data
+float accX, accY, accZ;
+float gyroX, gyroY, gyroZ;
+float accX_offset = 0.0, accY_offset = 0.0, accZ_offset = 0.0;
+float gyroX_offset = 0.0, gyroY_offset = 0.0, gyroZ_offset = 0.0;
+
+// Complementary filter parameters
+const float ALPHA = 0.55; // Adjusted to 55% gyro, 45% accel for fine-tuning
+float rollAcc = 0.0;      // Accelerometer-based roll angle (degrees)
+float rollFiltered = 0.0; // Filtered roll angle (degrees)
+float lastTime = 0.0;
+float angleOffset = 0.0;  // Dynamic offset for rollFiltered
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10); // Wait for Serial to initialize
+
+  // Initialize I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // Wake up MPU6050
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(PWR_MGMT_1);
+  Wire.write(0x00); // Set to 0 to wake up
+  if (Wire.endTransmission(true) != 0) {
+    Serial.println("Failed to initialize MPU6050");
+    while (1) delay(10);
+  }
+  Serial.println("MPU6050 initialized successfully");
+
+  // Delay to ensure sensor is stationary before calibration
+  Serial.println("Waiting 5 seconds for sensor to stabilize...");
+  delay(5000);
+
+  // Basic calibration (place sensor flat during setup)
+  Serial.println("Calibrating MPU6050... Ensure the sensor is flat and stationary!");
+  long calAccX = 0, calAccY = 0, calAccZ = 0;
+  long calGyroX = 0, calGyroY = 0, calGyroZ = 0;
+  for (int i = 0; i < 1000; i++) { // 1000 samples
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(ACCEL_XOUT_H);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU6050_ADDR, 6, true);
+    int16_t tempAccX = (Wire.read() << 8) | Wire.read();
+    int16_t tempAccY = (Wire.read() << 8) | Wire.read();
+    int16_t tempAccZ = (Wire.read() << 8) | Wire.read();
+    calAccX += tempAccX;
+    calAccY += tempAccY;
+    calAccZ += tempAccZ;
+
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(GYRO_XOUT_H);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU6050_ADDR, 6, true);
+    int16_t tempGyroX = (Wire.read() << 8) | Wire.read();
+    int16_t tempGyroY = (Wire.read() << 8) | Wire.read();
+    int16_t tempGyroZ = (Wire.read() << 8) | Wire.read();
+    calGyroX += tempGyroX;
+    calGyroY += tempGyroY;
+    calGyroZ += tempGyroZ;
+    delay(1);
+
+    if (i % 250 == 0) {
+      Serial.print("Calibration sample ");
+      Serial.print(i);
+      Serial.print(" - Raw accX: "); Serial.print(tempAccX);
+      Serial.print(" | Raw accY: "); Serial.print(tempAccY);
+      Serial.print(" | Raw accZ: "); Serial.println(tempAccZ);
+      Serial.print(" | Raw gyroX: "); Serial.print(tempGyroX);
+      Serial.print(" | Raw gyroY: "); Serial.print(tempGyroY);
+      Serial.print(" | Raw gyroZ: "); Serial.println(tempGyroZ);
+    }
+  }
+  accX_offset = calAccX / 1000.0 / ACCEL_SENSITIVITY;
+  accY_offset = calAccY / 1000.0 / ACCEL_SENSITIVITY;
+  accZ_offset = calAccZ / 1000.0 / ACCEL_SENSITIVITY - 1.0; // Subtract 1g for Z-axis gravity
+  gyroX_offset = calGyroX / 1000.0 / GYRO_SENSITIVITY;
+  gyroY_offset = calGyroY / 1000.0 / GYRO_SENSITIVITY;
+  gyroZ_offset = calGyroZ / 1000.0 / GYRO_SENSITIVITY;
+
+  Serial.print("Calibration offsets - accX: "); Serial.print(accX_offset, 4);
+  Serial.print(" | accY: "); Serial.print(accY_offset, 4);
+  Serial.print(" | accZ: "); Serial.println(accZ_offset, 4);
+  Serial.print("Gyro offsets - gyroX: "); Serial.print(gyroX_offset, 4);
+  Serial.print(" | gyroY: "); Serial.print(gyroY_offset, 4);
+  Serial.print(" | gyroZ: "); Serial.println(gyroZ_offset, 4);
+
+  // Initialize rollFiltered with the initial accelerometer angle
+  readMPU6050();
+  rollAcc = atan2(accY, accZ) * 180.0 / PI; // Use accY, accZ for X-axis roll
+  rollFiltered = rollAcc;
+  Serial.print("Initial rollAcc: "); Serial.print(rollAcc, 2);
+  Serial.print(" | Initial rollFiltered: "); Serial.println(rollFiltered, 2);
+
+  lastTime = micros() / 1000000.0;
+}
+
+bool readMPU6050() {
+  // Read accelerometer data
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(ACCEL_XOUT_H);
+  Wire.endTransmission(false);
+  if (Wire.requestFrom(MPU6050_ADDR, 6, true) != 6) {
+    Serial.println("Failed to read accelerometer data");
+    return false;
+  }
+  rawAccX = (Wire.read() << 8) | Wire.read();
+  rawAccY = (Wire.read() << 8) | Wire.read();
+  rawAccZ = (Wire.read() << 8) | Wire.read();
+
+  // Read gyroscope data
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(GYRO_XOUT_H);
+  Wire.endTransmission(false);
+  if (Wire.requestFrom(MPU6050_ADDR, 6, true) != 6) {
+    Serial.println("Failed to read gyroscope data");
+    return false;
+  }
+  rawGyroX = (Wire.read() << 8) | Wire.read();
+  rawGyroY = (Wire.read() << 8) | Wire.read();
+  rawGyroZ = (Wire.read() << 8) | Wire.read();
+
+  // Convert raw data to physical units with offset correction
+  accX = (rawAccX / ACCEL_SENSITIVITY) - accX_offset;
+  accY = (rawAccY / ACCEL_SENSITIVITY) - accY_offset;
+  accZ = (rawAccZ / ACCEL_SENSITIVITY) - accZ_offset;
+  gyroX = (rawGyroX / GYRO_SENSITIVITY) - gyroX_offset;
+  gyroY = (rawGyroY / GYRO_SENSITIVITY) - gyroY_offset;
+  gyroZ = (rawGyroZ / GYRO_SENSITIVITY) - gyroZ_offset;
+
+  return true;
+}
+
+void calculateAngles() {
+  float currentTime = micros() / 1000000.0;
+  float dt = currentTime - lastTime;
+  lastTime = currentTime;
+
+  // Roll around X-axis (using accY and accZ, gyroX)
+  rollAcc = atan2(accY, accZ) * 180.0 / PI;
+
+  // Calculate dynamic offset (average difference over 10 cycles)
+  static float offsetSum = 0.0;
+  static int offsetCount = 0;
+  static bool offsetInitialized = false;
+  if (!offsetInitialized) {
+    offsetSum += (rollAcc - rollFiltered);
+    offsetCount++;
+    if (offsetCount >= 10) {
+      angleOffset = offsetSum / 10.0;
+      offsetInitialized = true;
+    }
+  } else if (offsetCount >= 100) { // Reset offset every 100 cycles
+    offsetSum = 0.0;
+    offsetCount = 0;
+    offsetInitialized = false;
+  }
+
+  // Apply complementary filter with offset correction
+  rollFiltered = ALPHA * (rollFiltered + gyroX * dt) + (1.0 - ALPHA) * rollAcc;
+  rollFiltered += angleOffset;
+
+  // Smooth reset if difference is significant
+  if (abs(rollAcc - rollFiltered) > 45.0) {
+    rollFiltered = 0.8 * rollFiltered + 0.2 * rollAcc; // Smooth transition
+  }
+}
+
+void loop() {
+  if (readMPU6050()) {
+    // Print raw accelerometer and gyroscope data
+    Serial.print("accX: "); Serial.print(accX, 2);
+    Serial.print(" | accY: "); Serial.print(accY, 2);
+    Serial.print(" | accZ: "); Serial.print(accZ, 2);
+    Serial.print(" | gyroX: "); Serial.print(gyroX, 2);
+    Serial.print(" | gyroY: "); Serial.print(gyroY, 2);
+    Serial.print(" | gyroZ: "); Serial.println(gyroZ, 2);
+
+    calculateAngles();
+
+    // Output roll angles
+    Serial.print("Accelerometer Roll (deg): ");
+    Serial.print(rollAcc, 2);
+    Serial.print(" | Filtered Roll (deg): ");
+    Serial.println(rollFiltered, 2);
+  } else {
+    Serial.println("Error reading MPU6050 data");
+  }
+
+  delay(200); // 200ms delay for stability
+}
