@@ -1,0 +1,17 @@
+Given Specifications:
+- Gear Ratio: 23.1:1
+- PPR (Pulses Per Revolution): 11
+
+Pulses at the Motor Shaft:
+Since we are using 2 channels (A and B) and the CHANGE mode, we detect both the rising and falling edges of each pulse on both channels. 
+In CHANGE mode, each pulse generates 4 counts (Rising and Falling edges of both A and B channels). Therefore, the number of counts per revolution at the motor shaft is:
+Counts per Motor Shaft Revolution = 11 × 4 = 44 counts/rev
+
+
+The gear ratio is 23.1:1, meaning the motor shaft rotates 23.1 times to complete 1 output shaft revolution.
+Therefore, the counts per revolution at the output shaft is:
+Counts per Output Shaft Revolution = 44 × 23.1 = 1016.4 ≈ 1016 counts/rev
+
+--> Answer:
+Pulses per Revolution at Motor Shaft: 44 pulses/rev
+Pulses per Revolution at Output Shaft: 1016 pulses/rev
